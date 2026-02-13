@@ -25,6 +25,25 @@ Follow the steps on <a
 href="https://developers.google.com/speed/pagespeed/module/build_ngx_pagespeed_from_source">build
 ngx_pagespeed from source</a>.
 
+### Build From Scratch (with local fixes)
+
+This repo includes a helper script that initializes required submodules
+(including `testing-dependencies/ngx_psol`), applies legacy submodule URL
+fixes, bootstraps local Python 2.7 and gperf toolchains, and builds PSOL.
+
+Run:
+
+```bash
+bash scripts/build_from_scratch_with_fixes.sh
+```
+
+Expected output:
+
+- A PSOL archive in `testing-dependencies/mod_pagespeed/` named:
+  `psol-<version>-<arch>.tar.gz`
+
+The script prints the exact `tar.gz` path when done.
+
 ## How to use
 
 Follow the steps on <a
