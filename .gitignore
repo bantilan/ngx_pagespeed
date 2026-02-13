@@ -1,5 +1,11 @@
 test/tmp
-psol/
 psol-*.tar.gz
 *.*.*.*.tar.gz
+psol.tar.gz
 nginx
+testing-dependencies/mod_pagespeed/
+testing-dependencies/ngx_cache_purge/
+testing-dependencies/nginx/
+testing-dependencies/set-misc-nginx-module/
+testing-dependencies/ngx_devel_kit/
+testing-dependencies/headers-more-nginx-module/
