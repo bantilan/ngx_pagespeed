@@ -60,6 +60,49 @@ if ! git -C "$MPS_DIR" submodule update --init --recursive; then
   git -C "$MPS_DIR" submodule update --init
 fi
 
+bootstrap_legacy_build_tooling() {
+  # Some forks omit legacy checked-in build helpers required by build_psol.sh.
+  if [ -x "$MPS_DIR/build/gyp_chromium" ] && [ -d "$MPS_DIR/tools/gyp" ]; then
+    return 0
+  fi
+
+  local upstream_repo="${MPS_BOOTSTRAP_REPO:-https://github.com/apache/incubator-pagespeed-mod.git}"
+  local upstream_ref="${MPS_BOOTSTRAP_REF:-master}"
+  local bootstrap_dir="$TOOLS_DIR/.mps-bootstrap-src"
+
+  log "Missing legacy build tooling in mod_pagespeed fork; bootstrapping from $upstream_repo ($upstream_ref)"
+  rm -rf "$bootstrap_dir"
+  git clone --depth 1 --branch "$upstream_ref" "$upstream_repo" "$bootstrap_dir"
+  git -C "$bootstrap_dir" submodule update --init --recursive \
+    third_party/chromium/src/build \
+    tools/gyp || true
+
+  mkdir -p "$MPS_DIR/build" "$MPS_DIR/tools"
+
+  if [ ! -e "$MPS_DIR/build/gyp_chromium" ] && [ -f "$bootstrap_dir/build/gyp_chromium" ]; then
+    cp "$bootstrap_dir/build/gyp_chromium" "$MPS_DIR/build/gyp_chromium"
+    chmod +x "$MPS_DIR/build/gyp_chromium"
+  fi
+  if [ ! -e "$MPS_DIR/build/gyp_helper.py" ] && [ -f "$bootstrap_dir/build/gyp_helper.py" ]; then
+    cp "$bootstrap_dir/build/gyp_helper.py" "$MPS_DIR/build/gyp_helper.py"
+  fi
+  if [ ! -e "$MPS_DIR/build/common.gypi" ] && [ -f "$bootstrap_dir/build/common.gypi" ]; then
+    cp "$bootstrap_dir/build/common.gypi" "$MPS_DIR/build/common.gypi"
+  fi
+  if [ ! -e "$MPS_DIR/tools/gyp" ] && [ -d "$bootstrap_dir/tools/gyp" ]; then
+    cp -a "$bootstrap_dir/tools/gyp" "$MPS_DIR/tools/gyp"
+  fi
+  if [ ! -e "$MPS_DIR/third_party/chromium/src/build" ] && [ -d "$bootstrap_dir/third_party/chromium/src/build" ]; then
+    mkdir -p "$MPS_DIR/third_party/chromium/src"
+    cp -a "$bootstrap_dir/third_party/chromium/src/build" "$MPS_DIR/third_party/chromium/src/build"
+  fi
+
+  if [ ! -x "$MPS_DIR/build/gyp_chromium" ]; then
+    echo "Failed to bootstrap build/gyp_chromium into $MPS_DIR" >&2
+    exit 1
+  fi
+}
+
 GRPC_LOG_LINUX="$MPS_DIR/third_party/grpc/src/src/core/lib/support/log_linux.c"
 if [ -f "$GRPC_LOG_LINUX" ] && grep -q 'static long gettid(void)' "$GRPC_LOG_LINUX"; then
   log "Patching gRPC gettid conflict for modern glibc"
@@ -110,6 +153,8 @@ ln -sf "$PY_PREFIX/bin/python2.7" "$LOCAL_BIN/python"
 export PATH="$GPERF_PREFIX/bin:$LOCAL_BIN:$PATH"
 export LD_LIBRARY_PATH="$PY_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export LIBRARY_PATH="$PY_PREFIX/lib:${LIBRARY_PATH:-}"
+
+bootstrap_legacy_build_tooling
 
 log "Running PSOL build with local toolchain fixes"
 cd "$MPS_DIR"
