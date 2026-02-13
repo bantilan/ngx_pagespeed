@@ -1,4 +1,5 @@
 test/tmp
+psol
 psol-*.tar.gz
 *.*.*.*.tar.gz
 psol.tar.gz

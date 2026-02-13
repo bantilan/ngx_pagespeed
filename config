@@ -30,14 +30,17 @@ if [ "$mod_pagespeed_dir" = "unset" ] ; then
 
     psol_binary_url="$($ngx_addon_dir/scripts/format_binary_url.sh \
                            $ngx_addon_dir/PSOL_BINARY_URL)"
-    if [[ "$psol_binary_url" != https://* ]]; then
+    case "$psol_binary_url" in
+      https://*) ;;
+      *)
       echo "
   This is a development branch of ngx_pagespeed, which means there is no
   precompiled PSOL library available to link against.  Either build from a
   release tag, like latest-beta, or build PSOL from source:
     https://github.com/apache/incubator-pagespeed-ngx/wiki/Building-PSOL-From-Source"
       exit 1
-    fi
+      ;;
+    esac
 
     echo "
   You need to separately download the pagespeed library:
@@ -161,10 +164,12 @@ debug-level logging you can use the Release binaries."
       echo -n "
 Use the available Release binaries?"
       read -p " [Y/n] " yn
-      if [[ "$yn" == N* || "$yn" == n* ]]; then
-        echo "Cancelled."
-        exit 1
-      fi
+      case "$yn" in
+        N*|n*)
+          echo "Cancelled."
+          exit 1
+          ;;
+      esac
 
       buildtype=Release
     fi
