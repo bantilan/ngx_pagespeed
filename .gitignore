@@ -9,3 +9,4 @@ testing-dependencies/nginx/
 testing-dependencies/set-misc-nginx-module/
 testing-dependencies/ngx_devel_kit/
 testing-dependencies/headers-more-nginx-module/
+testing-dependencies/ngx_psol/

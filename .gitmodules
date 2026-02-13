@@ -22,3 +22,7 @@
 	path = testing-dependencies/headers-more-nginx-module
 	url = https://github.com/openresty/headers-more-nginx-module
 	ignore = all
+[submodule "testing-dependencies/ngx_psol"]
+	path = testing-dependencies/ngx_psol
+	url = https://github.com/bantilan/ngx_psol.git
+	ignore = all
