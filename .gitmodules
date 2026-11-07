@@ -1,7 +1,7 @@
 [submodule "testing-dependencies/mod_pagespeed"]
 	path = testing-dependencies/mod_pagespeed
 	url = https://github.com/bantilan/mod_pagespeed.git
-	ignore = all
+
 [submodule "testing-dependencies/ngx_cache_purge"]
 	path = testing-dependencies/ngx_cache_purge
 	url = https://github.com/FRiCKLE/ngx_cache_purge.git
@@ -25,4 +25,3 @@
 [submodule "testing-dependencies/ngx_psol"]
 	path = testing-dependencies/ngx_psol
 	url = https://github.com/bantilan/ngx_psol.git
-	ignore = all
