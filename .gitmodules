@@ -30,3 +30,6 @@
 	path = testing-dependencies/ngx_brotli
 	url = https://github.com/google/ngx_brotli.git
 	ignore = all
+[submodule "testing-dependencies/ModSecurity-nginx"]
+	path = testing-dependencies/ModSecurity-nginx
+	url = https://github.com/owasp-modsecurity/ModSecurity-nginx.git
