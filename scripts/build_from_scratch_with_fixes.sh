@@ -278,9 +278,9 @@ new = """#if OPENSSL_VERSION_NUMBER < 0x30000000L
 #else
     func = NULL;
 #endif"""
-if old in text:
+if new not in text and old in text:
     text = text.replace(old, new, 1)
-if old in text or new not in text:
+if new not in text:
     raise SystemExit("Could not verify OpenSSL 3 error-function compatibility patch")
 path.write_text(text)
 print("Avoided deprecated ERR_func_error_string() on OpenSSL 3.")
