@@ -23,3 +23,6 @@
 [submodule "testing-dependencies/ngx_psol"]
 	path = testing-dependencies/ngx_psol
 	url = https://github.com/bantilan/ngx_psol.git
+[submodule "testing-dependencies/ngx_brotli"]
+	path = testing-dependencies/ngx_brotli
+	url = https://github.com/google/ngx_brotli.git

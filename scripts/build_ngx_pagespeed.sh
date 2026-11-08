@@ -698,6 +698,7 @@ Not deleting $directory; name is suspiciously short.  Something is wrong."
                     "--add-module=$submodules_dir/ngx_devel_kit"
                     "--add-module=$submodules_dir/set-misc-nginx-module"
                     "--add-module=$submodules_dir/headers-more-nginx-module"
+                    "--add-module=$submodules_dir/ngx_brotli"
                     "--with-ipv6"
                     "--with-http_v2_module")
     if [ "$BUILD_TYPE" = "Debug" ]; then
