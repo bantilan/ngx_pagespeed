@@ -60,6 +60,77 @@ if ! git -C "$MPS_DIR" submodule update --init --recursive; then
   git -C "$MPS_DIR" submodule update --init
 fi
 
+# Keep PSOL source compatibility fixes with the PSOL build, rather than in the
+# outer Nginx/Debian packaging script.
+MPS_IMAGE_CC="$MPS_DIR/net/instaweb/rewriter/image.cc"
+AVIFENC_QUIET_PATCH_MODE="${AVIFENC_QUIET_PATCH_MODE:-auto}"
+
+patch_avifenc_quiet_flag() {
+  if [ -f "$MPS_IMAGE_CC" ] && grep -q 'avifenc --quiet' "$MPS_IMAGE_CC"; then
+    sed -i 's/avifenc --quiet --jobs/avifenc --jobs/g' "$MPS_IMAGE_CC"
+    log "Removed unsupported avifenc --quiet option from image.cc"
+  fi
+}
+
+case "$AVIFENC_QUIET_PATCH_MODE" in
+  auto)
+    if command -v avifenc >/dev/null 2>&1 && \
+        ! avifenc --help 2>&1 | grep -q -- '--quiet'; then
+      patch_avifenc_quiet_flag
+    fi
+    ;;
+  force) patch_avifenc_quiet_flag ;;
+  off) ;;
+  *)
+    echo "Invalid AVIFENC_QUIET_PATCH_MODE='$AVIFENC_QUIET_PATCH_MODE' (expected: auto|force|off)" >&2
+    exit 1
+    ;;
+esac
+
+has_filter_name() {
+  if command -v rg >/dev/null 2>&1; then
+    rg -q "$1" "$2"
+  else
+    grep -q "$1" "$2"
+  fi
+}
+
+apply_jsbuild_compat_fixes() {
+  local closure_gypi="$MPS_DIR/net/instaweb/closure.gypi"
+  local instaweb_gyp="$MPS_DIR/net/instaweb/instaweb.gyp"
+
+  # Keep Closure primitive processing enabled; disabling it can break generated JS.
+  if [ -f "$closure_gypi" ] && grep -q -- '--process_closure_primitives=false' "$closure_gypi"; then
+    sed -i '/--process_closure_primitives=false/d' "$closure_gypi"
+    log "Removed unsafe Closure flag --process_closure_primitives=false"
+  fi
+  if [ -f "$closure_gypi" ] && grep -q -- '--jscomp_off=undefinedVars' "$closure_gypi"; then
+    sed -i '/--jscomp_off=undefinedVars/d' "$closure_gypi"
+    log "Removed temporary jscomp_off=undefinedVars suppression"
+  fi
+
+  if [ -f "$instaweb_gyp" ]; then
+    if grep -q '/goog/labs/' "$instaweb_gyp"; then
+      sed -i '\|/goog/labs/|d' "$instaweb_gyp"
+      log "Removed over-broad goog/labs exclusion in instaweb.gyp"
+    fi
+    if ! grep -q '/goog/demos/' "$instaweb_gyp"; then
+      sed -i '/grep -v _test\.js/a\        '\''           | grep -v "/goog/demos/"'\''\n        '\''           | grep -v "/goog/testing/"'\''\n        '\''           | grep -v "/goog/test_module.js"'\''' "$instaweb_gyp"
+      log "Applied JS build compatibility exclusions in instaweb.gyp"
+    fi
+  fi
+}
+
+apply_jsbuild_compat_fixes
+
+REQUIRED_FILTER="${NGX_PAGESPEED_REQUIRED_FILTER:-prioritize_lcp_images}"
+if [ -n "$REQUIRED_FILTER" ] && ! has_filter_name \
+    "$REQUIRED_FILTER" "$MPS_DIR/net/instaweb/rewriter/rewrite_filter_names.gperf"; then
+  echo "Required filter '$REQUIRED_FILTER' not found in mod_pagespeed source." >&2
+  echo "Set NGX_PAGESPEED_REQUIRED_FILTER to a source filter name or an empty string to disable this check." >&2
+  exit 1
+fi
+
 bootstrap_legacy_build_tooling() {
   # Some forks omit legacy checked-in build helpers required by build_psol.sh.
   if [ -x "$MPS_DIR/build/gyp_chromium" ] && [ -d "$MPS_DIR/tools/gyp" ]; then
@@ -123,6 +194,19 @@ if [ "$(uname -m)" = x86_64 ] && [ -f "$X25519_ASM" ] && \
   printf '\n.section .note.GNU-stack,"",%%progbits\n' >> "$X25519_ASM"
 fi
 
+# The bundled OpenSSL RSA assembly is linked into the PSOL archive and also
+# needs to declare a non-executable stack for modern GNU linkers.
+if [ "$(uname -m)" = x86_64 ]; then
+  for asm in \
+      "$MPS_DIR/third_party/serf/linux-x86_64/crypto/bn/rsaz-x86_64.S" \
+      "$MPS_DIR/third_party/serf/linux-x86_64/crypto/bn/rsaz-avx2.S"; do
+    if [ -f "$asm" ] && ! grep -q '\.note\.GNU-stack' "$asm"; then
+      log "Marking $(basename "$asm") as non-executable-stack"
+      printf '\n.section .note.GNU-stack,"",%%progbits\n' >> "$asm"
+    fi
+  done
+fi
+
 mkdir -p "$TOOLS_DIR" "$LOCAL_BIN"
 
 PYTHON_SOURCE_DIR="$TOOLS_DIR/Python-2.7.18"
@@ -132,6 +216,9 @@ if [ ! -x "$PY_PREFIX/bin/python2.7" ]; then
 elif ! LD_LIBRARY_PATH="$PY_PREFIX/lib:${LD_LIBRARY_PATH:-}" \
     "$PY_PREFIX/bin/python2.7" -c 'import _hashlib' >/dev/null 2>&1; then
   log "Local Python 2 lacks _hashlib; rebuilding it with OpenSSL version detection fixed"
+  NEED_PYTHON_BUILD=1
+elif [ ! -f "$PY_PREFIX/.python_compat_patches_v2" ]; then
+  log "Rebuilding local Python 2 with deprecated APIs disabled or modernized"
   NEED_PYTHON_BUILD=1
 fi
 
@@ -175,6 +262,28 @@ if "openssl_major_re = re.compile(" not in text:
     text = text.replace(old, new, 1)
     path.write_text(text)
     print("Patched Python 2 to recognize OpenSSL 3 version macros.")
+PY
+
+  # OpenSSL 3 removed the function field from its error codes and deprecated
+  # ERR_func_error_string(). Keep the extra detail on older OpenSSL versions.
+  python3 - Modules/_hashopenssl.c <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "    func = ERR_func_error_string(errcode);"
+new = """#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    func = ERR_func_error_string(errcode);
+#else
+    func = NULL;
+#endif"""
+if old in text:
+    text = text.replace(old, new, 1)
+if old in text or new not in text:
+    raise SystemExit("Could not verify OpenSSL 3 error-function compatibility patch")
+path.write_text(text)
+print("Avoided deprecated ERR_func_error_string() on OpenSSL 3.")
 PY
 
   # Fix misleading indentation in Python 2's legacy AST source.
@@ -239,9 +348,65 @@ path.write_text(text)
 print("Checked libffi cleanup ftruncate return values.")
 PY
 
+  # siginterrupt() is deprecated on current glibc. Match its behavior by
+  # toggling SA_RESTART on the existing sigaction instead.
+  python3 - Modules/signalmodule.c <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = """    if (siginterrupt(sig_num, flag)<0) {
+        PyErr_SetFromErrno(PyExc_RuntimeError);
+        return NULL;
+    }"""
+new = """    {
+        struct sigaction act;
+        if (sigaction(sig_num, NULL, &act) < 0) {
+            PyErr_SetFromErrno(PyExc_RuntimeError);
+            return NULL;
+        }
+        if (flag)
+            act.sa_flags &= ~SA_RESTART;
+        else
+            act.sa_flags |= SA_RESTART;
+        if (sigaction(sig_num, &act, NULL) < 0) {
+            PyErr_SetFromErrno(PyExc_RuntimeError);
+            return NULL;
+        }
+    }"""
+if old in text:
+    text = text.replace(old, new, 1)
+if old in text or new not in text:
+    raise SystemExit("Could not verify Python signalmodule sigaction patch")
+path.write_text(text)
+print("Replaced deprecated siginterrupt() with sigaction().")
+PY
+
   CXX="${CXX:-g++}" ./configure --prefix="$PY_PREFIX" --enable-shared --without-ensurepip
+  # Python 2 exposes insecure tempnam()/tmpnam() APIs and an obsolete ftime()
+  # fallback; disable them where gettimeofday() or tempfile is available.
+  python3 - pyconfig.h <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+macros = ["HAVE_TEMPNAM", "HAVE_TMPNAM", "HAVE_TMPNAM_R"]
+if re.search(r"^#define HAVE_GETTIMEOFDAY\b", text, flags=re.MULTILINE):
+    macros.append("HAVE_FTIME")
+for macro in macros:
+    text = re.sub(r"^#define " + macro + r"\s+1\s*$",
+                  "/* #undef " + macro + " */", text, flags=re.MULTILINE)
+    if re.search(r"^#define " + macro + r"\b", text, flags=re.MULTILINE):
+        raise SystemExit("Could not disable legacy Python feature: " + macro)
+path.write_text(text)
+print("Disabled Python 2's insecure temp-name APIs and deprecated ftime() fallback.")
+PY
   make -j"$JOBS"
   make install
+  touch "$PY_PREFIX/.python_compat_patches_v2"
   if ! LD_LIBRARY_PATH="$PY_PREFIX/lib:${LD_LIBRARY_PATH:-}" \
       "$PY_PREFIX/bin/python2.7" -c 'import _hashlib' >/dev/null 2>&1; then
     log "WARNING: Python 2 _hashlib still unavailable after rebuilding."
