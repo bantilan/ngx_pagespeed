@@ -39,6 +39,7 @@
 #include "ngx_rewrite_driver_factory.h"
 #include "ngx_rewrite_options.h"
 #include "ngx_server_context.h"
+#include "ngx_self_fetch_label.h"
 
 #include "net/instaweb/http/public/async_fetch.h"
 #include "net/instaweb/http/public/cache_url_async_fetcher.h"
@@ -1688,6 +1689,42 @@ bool is_pagespeed_subrequest(ngx_http_request_t* r) {
   return (user_agent.find(kModPagespeedSubrequestUserAgent) != user_agent.npos);
 }
 
+struct ps_self_fetch_relabel_t {
+  NgxSelfFetchLabel label;
+  NgxSelfFetchSaved<ngx_connection_t> saved;
+};
+
+void ps_self_fetch_restore(void* data) {
+  NgxRestoreSelfFetch(
+      static_cast<ps_self_fetch_relabel_t*>(data)->saved);
+}
+
+ngx_int_t ps_self_fetch_post_read_handler(ngx_http_request_t* r) {
+  if (r != r->main || !is_pagespeed_subrequest(r)) {
+    return NGX_DECLINED;
+  }
+
+  ngx_connection_t* connection = r->connection;
+  struct sockaddr* local = NULL;
+  if (ngx_connection_local_sockaddr(connection, &local, 0) != NGX_OK) {
+    local = NULL;
+  }
+  if (!NgxSelfFetchPeerIsThisServer(connection->sockaddr, local)) {
+    return NGX_DECLINED;
+  }
+
+  ngx_pool_cleanup_t* cleanup =
+      ngx_pool_cleanup_add(r->pool, sizeof(ps_self_fetch_relabel_t));
+  if (cleanup == NULL) {
+    return NGX_HTTP_INTERNAL_SERVER_ERROR;
+  }
+  ps_self_fetch_relabel_t* relabel =
+      static_cast<ps_self_fetch_relabel_t*>(cleanup->data);
+  NgxRelabelSelfFetch(connection, &relabel->label, &relabel->saved);
+  cleanup->handler = ps_self_fetch_restore;
+  return NGX_DECLINED;
+}
+
 void ps_release_base_fetch(ps_request_ctx_t* ctx) {
   // In the normal flow BaseFetch doesn't delete itself in HandleDone() because
   // we still need to receive notification via pipe and call
@@ -3149,6 +3186,16 @@ ngx_int_t ps_init(ngx_conf_t* cf) {
       return NGX_ERROR;
     }
     *h = ps_preaccess_handler;
+
+    // Internal fetches can originate from loopback and must not inherit
+    // localhost privileges from the address-based access rules.
+    ngx_http_handler_pt* self_fetch_handler =
+        static_cast<ngx_http_handler_pt*>(ngx_array_push(
+            &cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers));
+    if (self_fetch_handler == NULL) {
+      return NGX_ERROR;
+    }
+    *self_fetch_handler = ps_self_fetch_post_read_handler;
   }
 
   return NGX_OK;

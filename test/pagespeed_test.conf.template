@@ -705,6 +705,21 @@ http {
   server {
     listen @@SECONDARY_PORT@@;
     listen [::]:@@SECONDARY_PORT@@;
+    server_name access-restricted.example.com;
+    pagespeed on;
+    pagespeed FileCachePath "@@FILE_CACHE@@";
+    pagespeed EnableFilters inline_css;
+
+    location /access-controlled/ {
+      allow 127.0.0.1;
+      allow ::1;
+      deny all;
+    }
+  }
+
+  server {
+    listen @@SECONDARY_PORT@@;
+    listen [::]:@@SECONDARY_PORT@@;
     server_name domain-hyperlinks-on.example.com;
     pagespeed FileCachePath "@@FILE_CACHE@@";
 

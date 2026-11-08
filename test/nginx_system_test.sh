@@ -63,6 +63,18 @@ mkdir -p "$APACHE_DOC_ROOT"
 make -f "$APACHE_DOC_SRC/Makefile.tests" setup_doc_root \
   INSTALL_DATA_DIR="$APACHE_DOC_SRC"
 
+# This public page references a resource protected only by a localhost rule.
+# A PageSpeed self-fetch must not inherit the allowlisted loopback address.
+mkdir -p "$SERVER_ROOT/access-controlled"
+cat > "$SERVER_ROOT/access-restricted.html" <<'EOF'
+<!doctype html>
+<html><head><link rel="stylesheet" href="/access-controlled/secret.css"></head>
+<body>public page</body></html>
+EOF
+cat > "$SERVER_ROOT/access-controlled/secret.css" <<'EOF'
+body { color: #123456; }
+EOF
+
 # We need check and check_not before we source SYSTEM_TEST_FILE that provides
 # them.
 function handle_failure_simple() {
@@ -588,6 +600,17 @@ fetch_until "$URL" "fgrep -c .pagespeed." 1 --header=Host:www.google.com
 # a 404.  Instead it should use a loopback fetch and succeed.
 URL="$HOSTNAME/mod_pagespeed_example/styles/big.css.pagespeed.ce.8CfGBvwDhH.css"
 check wget -O /dev/null --header=Host:www.google.com "$URL"
+
+start_test "PageSpeed self-fetches respect address access rules"
+HOST_NAME="access-restricted.example.com"
+URL="http://$SECONDARY_HOSTNAME/access-restricted.html?PageSpeed=on"
+OUT=$(curl -sS --noproxy '*' -H "Host: $HOST_NAME" "$URL")
+check fgrep -q 'href="/access-controlled/secret.css"' <<< "$OUT"
+check_not fgrep -q 'color: #123456' <<< "$OUT"
+LOCAL_RESOURCE_CODE=$(curl -sS --noproxy '*' -o /dev/null -w '%{http_code}' \
+  -H "Host: $HOST_NAME" \
+  "http://$SECONDARY_HOSTNAME/access-controlled/secret.css")
+check [ "$LOCAL_RESOURCE_CODE" = 200 ]
 
 start_test statistics load
 

@@ -256,6 +256,7 @@ $ps_src/ngx_pagespeed.h \
 $ps_src/ngx_rewrite_driver_factory.h \
 $ps_src/ngx_rewrite_options.h \
 $ps_src/ngx_server_context.h \
+$ps_src/ngx_self_fetch_label.h \
 $ps_src/ngx_url_async_fetcher.h \
 $psol_binary"
 NPS_SRCS=" \
@@ -271,6 +272,7 @@ $ps_src/ngx_pagespeed.cc \
 $ps_src/ngx_rewrite_driver_factory.cc \
 $ps_src/ngx_rewrite_options.cc \
 $ps_src/ngx_server_context.cc \
+$ps_src/ngx_self_fetch_label.cc \
 $ps_src/ngx_url_async_fetcher.cc"
 # Save our sources in a separate var since we may need it in config.make
 PS_NGX_SRCS="$NGX_ADDON_SRCS \
