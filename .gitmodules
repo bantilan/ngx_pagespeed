@@ -1,18 +1,23 @@
 [submodule "testing-dependencies/mod_pagespeed"]
 	path = testing-dependencies/mod_pagespeed
 	url = https://github.com/bantilan/mod_pagespeed.git
+	ignore = all
 [submodule "testing-dependencies/ngx_cache_purge"]
 	path = testing-dependencies/ngx_cache_purge
 	url = https://github.com/FRiCKLE/ngx_cache_purge.git
+	ignore = all
 [submodule "testing-dependencies/nginx"]
 	path = testing-dependencies/nginx
 	url = https://github.com/nginx/nginx.git
+	ignore = all
 [submodule "testing-dependencies/set-misc-nginx-module"]
 	path = testing-dependencies/set-misc-nginx-module
 	url = https://github.com/openresty/set-misc-nginx-module
+	ignore = all
 [submodule "testing-dependencies/ngx_devel_kit"]
 	path = testing-dependencies/ngx_devel_kit
 	url = https://github.com/simpl/ngx_devel_kit
+	ignore = all
 [submodule "testing-dependencies/headers-more-nginx-module"]
 	path = testing-dependencies/headers-more-nginx-module
 	url = https://github.com/openresty/headers-more-nginx-module
@@ -20,6 +25,8 @@
 [submodule "testing-dependencies/ngx_psol"]
 	path = testing-dependencies/ngx_psol
 	url = https://github.com/bantilan/ngx_psol.git
+	ignore = all
 [submodule "testing-dependencies/ngx_brotli"]
 	path = testing-dependencies/ngx_brotli
 	url = https://github.com/google/ngx_brotli.git
+	ignore = all
