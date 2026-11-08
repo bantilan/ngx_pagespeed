@@ -1705,10 +1705,10 @@ ngx_int_t ps_self_fetch_post_read_handler(ngx_http_request_t* r) {
   }
 
   ngx_connection_t* connection = r->connection;
-  struct sockaddr* local = NULL;
-  if (ngx_connection_local_sockaddr(connection, &local, 0) != NGX_OK) {
-    local = NULL;
-  }
+  const struct sockaddr* local =
+      ngx_connection_local_sockaddr(connection, NULL, 0) == NGX_OK
+          ? connection->local_sockaddr
+          : NULL;
   if (!NgxSelfFetchPeerIsThisServer(connection->sockaddr, local)) {
     return NGX_DECLINED;
   }
