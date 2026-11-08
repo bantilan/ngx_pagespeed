@@ -496,6 +496,11 @@ add support for dynamic modules in a way compatible with ngx_pagespeed until
       install_dependencies "apt-get install ${INSTALL_FLAGS}" debian_is_installed \
         build-essential zlib1g-dev libpcre3 libpcre3-dev unzip wget uuid-dev
 
+      if "$DEVEL"; then
+        install_dependencies "apt-get install ${INSTALL_FLAGS}" debian_is_installed \
+          libmodsecurity-dev
+      fi
+
       if gcc_too_old; then
         if [ ! -e /usr/lib/gcc-mozilla/bin/gcc ]; then
           status "Detected that gcc is older than 4.8.  Installing gcc-mozilla"
@@ -513,6 +518,10 @@ add support for dynamic modules in a way compatible with ngx_pagespeed until
 
       install_dependencies "yum install ${INSTALL_FLAGS}" redhat_is_installed \
         gcc-c++ pcre-devel zlib-devel make unzip wget libuuid-devel
+      if "$DEVEL"; then
+        install_dependencies "yum install ${INSTALL_FLAGS}" redhat_is_installed \
+          libmodsecurity-devel
+      fi
       if gcc_too_old; then
         if [ ! -e /opt/rh/devtoolset-2/root/usr/bin/gcc ]; then
           redhat_major_version=$(
@@ -699,6 +708,7 @@ Not deleting $directory; name is suspiciously short.  Something is wrong."
                     "--add-module=$submodules_dir/set-misc-nginx-module"
                     "--add-module=$submodules_dir/headers-more-nginx-module"
                     "--add-module=$submodules_dir/ngx_brotli"
+                    "--add-module=$submodules_dir/ModSecurity-nginx"
                     "--with-ipv6"
                     "--with-http_v2_module")
     if [ "$BUILD_TYPE" = "Debug" ]; then
