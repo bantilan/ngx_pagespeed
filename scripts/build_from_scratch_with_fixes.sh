@@ -9,6 +9,10 @@ PY_PREFIX="$TOOLS_DIR/python2"
 GPERF_PREFIX="$TOOLS_DIR/gperf"
 LOCAL_BIN="$MPS_DIR/.local-bin"
 JOBS="${JOBS:-$(nproc)}"
+GIT_REFERENCE_ARGS=()
+if [ -n "${GIT_REFERENCE_CACHE:-}" ] && [ -d "$GIT_REFERENCE_CACHE" ]; then
+  GIT_REFERENCE_ARGS=(--reference "$GIT_REFERENCE_CACHE")
+fi
 
 log() {
   printf '[build-fix] %s\n' "$*"
@@ -31,7 +35,7 @@ if [ ! -d "$ROOT_DIR/.git" ]; then
 fi
 
 log "Initializing top-level submodules"
-git -C "$ROOT_DIR" submodule update --init \
+git -C "$ROOT_DIR" submodule update --init "${GIT_REFERENCE_ARGS[@]}" \
   testing-dependencies/mod_pagespeed \
   testing-dependencies/ngx_cache_purge \
   testing-dependencies/nginx \
@@ -55,9 +59,9 @@ git -C "$MPS_DIR" config -f .gitmodules submodule.third_party/serf/src.url "http
 git -C "$MPS_DIR" submodule sync --recursive
 
 log "Initializing recursive mod_pagespeed submodules"
-if ! git -C "$MPS_DIR" submodule update --init --recursive; then
+if ! git -C "$MPS_DIR" submodule update --init --recursive "${GIT_REFERENCE_ARGS[@]}"; then
   log "Recursive submodule fetch hit legacy nested issues; retrying one level only"
-  git -C "$MPS_DIR" submodule update --init
+  git -C "$MPS_DIR" submodule update --init "${GIT_REFERENCE_ARGS[@]}"
 fi
 
 # Keep PSOL source compatibility fixes with the PSOL build, rather than in the
@@ -143,8 +147,12 @@ bootstrap_legacy_build_tooling() {
 
   log "Missing legacy build tooling in mod_pagespeed fork; bootstrapping from $upstream_repo ($upstream_ref)"
   rm -rf "$bootstrap_dir"
-  git clone --depth 1 --branch "$upstream_ref" "$upstream_repo" "$bootstrap_dir"
-  git -C "$bootstrap_dir" submodule update --init --recursive \
+  if [ -n "${GIT_REFERENCE_CACHE:-}" ] && [ -d "$GIT_REFERENCE_CACHE" ]; then
+    git clone --reference-if-able "$GIT_REFERENCE_CACHE" --depth 1 --branch "$upstream_ref" "$upstream_repo" "$bootstrap_dir"
+  else
+    git clone --depth 1 --branch "$upstream_ref" "$upstream_repo" "$bootstrap_dir"
+  fi
+  git -C "$bootstrap_dir" submodule update --init --recursive "${GIT_REFERENCE_ARGS[@]}" \
     third_party/chromium/src/build \
     tools/gyp || true
 
