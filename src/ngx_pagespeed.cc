@@ -2454,6 +2454,23 @@ ngx_int_t ps_html_rewrite_header_filter(ngx_http_request_t* r) {
 
   // TODO(jefftk): is this thread safe?
   copy_response_headers_from_ngx(r, ctx->base_fetch->response_headers());
+  if (cfg_s->server_context->global_options()->Enabled(
+          RewriteOptions::kConvertToAvif) &&
+      !ctx->base_fetch->response_headers()->HasValue(
+          HttpAttributes::kVary, HttpAttributes::kUserAgent)) {
+    // Rewritten HTML can contain AVIF URLs selected from User-Agent when its
+    // initial Accept header does not include image/avif. Keep intermediary
+    // caches from reusing that HTML for browsers without AVIF support.
+    ctx->base_fetch->response_headers()->Add(HttpAttributes::kVary,
+                                             HttpAttributes::kUserAgent);
+  }
+  if (cfg_s->server_context->global_options()->Enabled(
+          RewriteOptions::kConvertToAvif) &&
+      !ctx->base_fetch->response_headers()->HasValue(
+          HttpAttributes::kVary, HttpAttributes::kAccept)) {
+    ctx->base_fetch->response_headers()->Add(HttpAttributes::kVary,
+                                             HttpAttributes::kAccept);
+  }
 
   ps_set_buffered(r, true);
   r->filter_need_in_memory = 1;
