@@ -720,6 +720,8 @@ namespace {
 
 typedef struct {
   NgxRewriteDriverFactory* driver_factory;
+  // Per configuration cycle, so statistics scopes survive graceful reloads.
+  int server_context_count;
   MessageHandler* handler;
 } ps_main_conf_t;
 
@@ -1152,16 +1154,12 @@ void ps_merge_options(NgxRewriteOptions* parent_options,
   }
 }
 
-namespace {
-
-int times_ps_merge_srv_conf_called = 0;
-
-}  // namespace
-
 // Called exactly once per server block to merge the main configuration with the
 // configuration for this server.
 char* ps_merge_srv_conf(ngx_conf_t* cf, void* parent, void* child) {
-  times_ps_merge_srv_conf_called += 1;
+  ps_main_conf_t* cfg_m = static_cast<ps_main_conf_t*>(
+      ngx_http_conf_get_module_main_conf(cf, ngx_pagespeed));
+  ++cfg_m->server_context_count;
 
   ps_srv_conf_t* parent_cfg_s = static_cast<ps_srv_conf_t*>(parent);
   ps_srv_conf_t* cfg_s = static_cast<ps_srv_conf_t*>(child);
@@ -1178,10 +1176,7 @@ char* ps_merge_srv_conf(ngx_conf_t* cf, void* parent, void* child) {
   // debugging easier, substitute our own unique identifier.
   // TODO(jefftk): either figure out how to get a hostname and port for this
   // server block or change ServerContext not to ask for them.
-  int dummy_port = -times_ps_merge_srv_conf_called;
-
-  ps_main_conf_t* cfg_m = static_cast<ps_main_conf_t*>(
-      ngx_http_conf_get_module_main_conf(cf, ngx_pagespeed));
+  int dummy_port = -cfg_m->server_context_count;
   cfg_m->driver_factory->SetMainConf(parent_cfg_s->options);
   cfg_s->server_context = cfg_m->driver_factory->MakeNgxServerContext(
       "dummy_hostname", dummy_port);
