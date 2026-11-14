@@ -70,7 +70,6 @@ class NgxRewriteDriverFactory : public SystemRewriteDriverFactory {
   virtual MessageHandler* DefaultMessageHandler();
   virtual FileSystem* DefaultFileSystem();
   virtual Timer* DefaultTimer();
-  virtual NamedLockManager* DefaultLockManager();
   // Create a new RewriteOptions.  In this implementation it will be an
   // NgxRewriteOptions, and it will have CoreFilters explicitly set.
   virtual RewriteOptions* NewRewriteOptions();

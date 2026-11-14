@@ -143,11 +143,6 @@ Timer* NgxRewriteDriverFactory::DefaultTimer() {
   return new PosixTimer;
 }
 
-NamedLockManager* NgxRewriteDriverFactory::DefaultLockManager() {
-  CHECK(false);
-  return NULL;
-}
-
 RewriteOptions* NgxRewriteDriverFactory::NewRewriteOptions() {
   NgxRewriteOptions* options = new NgxRewriteOptions(thread_system());
   // TODO(jefftk): figure out why using SetDefaultRewriteLevel like

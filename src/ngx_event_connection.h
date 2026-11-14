@@ -57,11 +57,14 @@ typedef void (*callbackPtr)(const ps_event_data&);
 class NgxEventConnection {
  public:
   explicit NgxEventConnection(callbackPtr handler);
+  ~NgxEventConnection();
 
   // Creates the file descriptors and ngx_connection_t required for event
   // messaging between pagespeed and nginx.
   bool Init(ngx_cycle_t* cycle);
-  // Shuts down the underlying file descriptors and connection created in Init()
+  // Shuts down the underlying file descriptors and connection created in
+  // Init(): the write side directly, the read side through nginx so the
+  // event registration goes away with the fd.
   void Shutdown();
   // Constructs a ps_event_data and writes it to the underlying named pipe.
   bool WriteEvent(char type, void* sender);
@@ -70,7 +73,7 @@ class NgxEventConnection {
   // Reads and processes what is available in the named pipe's buffer.
   void Drain();
  private:
-  static bool CreateNgxConnection(ngx_cycle_t* cycle, ngx_fd_t pipe_fd);
+  bool CreateNgxConnection(ngx_cycle_t* cycle, ngx_fd_t pipe_fd);
   static void ReadEventHandler(ngx_event_t* e);
   static bool ReadAndNotify(ngx_fd_t fd);
 
@@ -78,6 +81,19 @@ class NgxEventConnection {
   // We own these file descriptors
   ngx_fd_t pipe_write_fd_;
   ngx_fd_t pipe_read_fd_;
+
+  // The nginx connection object carrying pipe_read_fd_ in the event loop,
+  // captured when it is registered (CreateNgxConnection) so Shutdown() can
+  // close the read side through nginx.
+  ngx_connection_t* connection_;
+
+  // Serializes pipe writes against Shutdown()'s close.
+  pthread_mutex_t write_mutex_;
+
+  // Set under write_mutex_ by Shutdown() together with the write-fd close.
+  // WriteEvent() checks it under the same mutex before writing: a late
+  // writer then drops the event instead of reaching a reused fd number.
+  bool closed_;
 
   DISALLOW_COPY_AND_ASSIGN(NgxEventConnection);
 };

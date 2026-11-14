@@ -40,7 +40,7 @@ const char kHeadersComplete = 'H';
 const char kFlush = 'F';
 const char kDone = 'D';
 
-NgxEventConnection* NgxBaseFetch::event_connection = NULL;
+std::atomic<NgxEventConnection*> NgxBaseFetch::event_connection(NULL);
 int NgxBaseFetch::active_base_fetches = 0;
 
 NgxBaseFetch::NgxBaseFetch(StringPiece url,
@@ -73,13 +73,17 @@ NgxBaseFetch::~NgxBaseFetch() {
 }
 
 bool NgxBaseFetch::Initialize(ngx_cycle_t* cycle) {
-  CHECK(event_connection == NULL) << "event connection already set";
-  event_connection = new NgxEventConnection(ReadCallback);
-  return event_connection->Init(cycle);
+  CHECK(event_connection.load() == NULL) << "event connection already set";
+  NgxEventConnection* connection = new NgxEventConnection(ReadCallback);
+  event_connection.store(connection, std::memory_order_release);
+  return connection->Init(cycle);
 }
 
 void NgxBaseFetch::Terminate() {
-  if (event_connection != NULL) {
+  // Terminate runs on the nginx main thread, the only writer of the global,
+  // so a plain load suffices here.
+  NgxEventConnection* connection = event_connection.load();
+  if (connection != NULL) {
     GoogleMessageHandler handler;
     PosixTimer timer;
     int64 timeout_us = Timer::kSecondUs * 30;
@@ -94,7 +98,7 @@ void NgxBaseFetch::Terminate() {
     // until the timeout expires.
     // TODO(oschaaf): This needs more work.
     while (NgxBaseFetch::active_base_fetches > 0 && end_us > timer.NowUs()) {
-      event_connection->Drain();
+      connection->Drain();
       usleep(sleep_microseconds);
     }
 
@@ -104,10 +108,21 @@ void NgxBaseFetch::Terminate() {
           NgxBaseFetch::active_base_fetches);
     }
 
-    // Close down the named pipe.
-    event_connection->Shutdown();
-    delete event_connection;
-    event_connection = NULL;
+    // Detach the event connection first so a completion arriving after this
+    // point finds a null connection and does nothing (RequestCollection),
+    // then close the pipe. The NgxEventConnection itself is deliberately
+    // not deleted: a rewrite thread that outlived the drain may already
+    // have loaded the non-null pointer and still call WriteEvent() on it.
+    // That call is safe because Shutdown() refuses writes on the kept-alive
+    // object: it marks the connection closed under the write mutex, so the
+    // late WriteEvent() is dropped instead of reaching the closed fd
+    // number, which worker-exit teardown (factory shutdown, cache cleanup)
+    // may already have reopened for another file or socket. Freeing the
+    // object would turn the same call into a use-after-free. This is the
+    // worker exit path: one small object per process is leaked, and
+    // nothing collects its output anyway.
+    event_connection.store(NULL, std::memory_order_release);
+    connection->Shutdown();
   }
 }
 
@@ -176,6 +191,17 @@ void NgxBaseFetch::ReadCallback(const ps_event_data& data) {
 
   int rc;
   bool run_posted = true;
+  // An upstream (proxy_pass and the other *_pass modules) that is still
+  // delivering the response owns the request: its event handlers are
+  // installed, the reference count is its, and its cleanup handler, which
+  // drops that reference, is on the request's cleanup list.  That is the
+  // state of the html transform of a proxied page while the origin is still
+  // sending it.  Sampled BEFORE the handler below runs: the in-place lookup's
+  // decline path starts the upstream from inside that call and balances its
+  // own r->count++ with the NGX_DONE it returns, so an upstream started there
+  // must not count here.
+  const bool upstream_active =
+      r->upstream != nullptr && r->upstream->cleanup != nullptr;
   // If we are unlucky enough to have our connection finalized mid-ipro-lookup,
   // we must enter a different flow. Also see ps_in_place_check_header_filter().
   if ((ctx->base_fetch->base_fetch_type_ != kIproLookup)
@@ -195,6 +221,29 @@ void NgxBaseFetch::ReadCallback(const ps_event_data& data) {
 #endif
 
   ngx_connection_t* c = r->connection;
+  // While the upstream owns the request it is not finalized for output that
+  // has only gone down the filter chain: that would install nginx's writer
+  // and ngx_http_test_reading over the upstream's handlers, leaving the
+  // request's lifetime to them without the reference the upstream's cleanup
+  // expects.  Any other result ends the request under the upstream, so the
+  // reference its cleanup handler drops is held first, as
+  // ngx_http_upstream_create() does before calling that handler on a live
+  // request; and the posted requests are then run whatever the branch above
+  // decided, because ending the request posts nginx's terminate handler and
+  // nothing else runs it when the client is already gone (an upstream that
+  // is filling a cache stays active after a client close).  The held
+  // reference keeps r and c alive through the finalize, and the posted-request
+  // loop stops once the terminate handler has destroyed the connection.
+  if (upstream_active) {
+    if (rc == NGX_AGAIN) {
+      if (run_posted) {
+        ngx_http_run_posted_requests(c);
+      }
+      return;
+    }
+    r->main->count++;
+    run_posted = true;
+  }
   ngx_http_finalize_request(r, rc);
 
   if (run_posted) {
@@ -285,13 +334,27 @@ void NgxBaseFetch::RequestCollection(char type) {
     return;
   }
 
+  // Read the pointer once and use the local for the rest of the function:
+  // checking the global and then dereferencing it would let Terminate()
+  // null it in between (the refcount increment below is a full barrier, so
+  // the compiler cannot fuse the two reads either).
+  NgxEventConnection* connection =
+      event_connection.load(std::memory_order_acquire);
+  // After Terminate() tears the event channel down, a completion from a
+  // rewrite thread that outlived the shutdown drain has no channel left to
+  // notify: drop it. The worker is exiting, so nobody would collect the
+  // output anyway.
+  if (connection == NULL) {
+    return;
+  }
+
   // We must optimistically increment the refcount, and decrement it
   // when we conclude we failed. If we only increment on a successfull write,
   // there's a small chance that between writing and adding to the refcount
   // both pagespeed and nginx will release their refcount -- destructing
   // this NgxBaseFetch instance.
   IncrementRefCount();
-  if (!event_connection->WriteEvent(type, this)) {
+  if (!connection->WriteEvent(type, this)) {
     DecrementRefCount();
   }
 }

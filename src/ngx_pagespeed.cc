@@ -72,6 +72,8 @@
 #include "pagespeed/kernel/thread/pthread_shared_mem.h"
 #include "pagespeed/kernel/util/gzip_inflater.h"
 #include "pagespeed/kernel/util/statistics_logger.h"
+#include "pagespeed/nginx/ngx_inplace_url_agreement.h"
+#include "pagespeed/nginx/ngx_request_body.h"
 #include "pagespeed/system/in_place_resource_recorder.h"
 #include "pagespeed/system/system_caches.h"
 #include "pagespeed/system/system_request_context.h"
@@ -84,7 +86,6 @@ extern ngx_module_t ngx_pagespeed;
 // Unused flag, see
 // http://lxr.evanmiller.org/http/source/http/ngx_http_request.h#L130
 #define  NGX_HTTP_PAGESPEED_BUFFERED 0x08
-#define  POST_BUF_READ_SIZE 65536
 
 // Needed for SystemRewriteDriverFactory to use shared memory.
 #define PAGESPEED_SUPPORT_POSIX_SHARED_MEM
@@ -234,6 +235,21 @@ namespace {
 
 void ps_release_base_fetch(ps_request_ctx_t* ctx);
 
+// nginx requires a content handler that does not use the request body to
+// discard it before sending its own response.  Discarding is a no-op for
+// subrequests and for a body that was already read (r->request_body set), so
+// paths that read the body (admin and beacon POSTs) need no exception.  When
+// the body cannot be discarded, the connection must not be reused; a
+// lingering close drains the leftover bytes before it is closed.
+void ps_discard_request_body(ngx_http_request_t* r) {
+  if (ngx_http_discard_request_body(r) != NGX_OK) {
+    r->keepalive = 0;
+    if (r->headers_in.content_length_n > 0 || r->headers_in.chunked) {
+      r->lingering_close = 1;
+    }
+  }
+}
+
 }  // namespace
 
 namespace ps_base_fetch {
@@ -325,6 +341,19 @@ ngx_int_t ps_base_fetch_handler(ngx_http_request_t* r) {
       }
     } else {
       ngx_http_clean_header(r);
+    }
+    // The module is about to answer this request itself, so the request
+    // body must be discarded before the response is sent; see
+    // ps_discard_request_body.  Two cases do not answer the request: the
+    // in-place lookup miss, which declines inside the header filter chain
+    // below so the server's own handler answers and may need the body, and
+    // the HTML transform, which only rewrites an upstream response whose
+    // content handler owns the body.
+    const bool ipro_lookup_miss =
+        ctx->base_fetch->base_fetch_type() == kIproLookup && !status_ok;
+    if (!ipro_lookup_miss &&
+        ctx->base_fetch->base_fetch_type() != kHtmlTransform) {
+      ps_discard_request_body(r);
     }
     // collect response headers from pagespeed
     rc = ctx->base_fetch->CollectHeaders(&r->headers_out);
@@ -563,6 +592,8 @@ void copy_request_headers_from_ngx(const ngx_http_request_t* r,
   // TODO(chaizhenhua): only allow RewriteDriver::kPassThroughRequestAttributes?
   headers->set_major_version(r->http_version / 1000);
   headers->set_minor_version(r->http_version % 1000);
+  headers->set_method(
+      RequestHeaders::MethodFromString(str_to_string_piece(r->method_name)));
   copy_headers_from_table(r->headers_in.headers, headers);
 }
 
@@ -719,13 +750,21 @@ ngx_int_t copy_response_headers_to_ngx(
 namespace {
 
 typedef struct {
+  // The driver factory of this configuration cycle.  The cycle owns it: the
+  // first server cleanup of the cycle deletes it (so the worker threads stop
+  // before the proxy fetch factories go), and the main conf cleanup deletes
+  // it when no server did, as for a cycle that never reached ps_init_module.
   NgxRewriteDriverFactory* driver_factory;
   // Per configuration cycle, so statistics scopes survive graceful reloads.
   int server_context_count;
   MessageHandler* handler;
+  // Set once this cycle's factory has been deleted.
+  bool factory_deleted;
 } ps_main_conf_t;
 
 typedef struct {
+  // The main conf of the cycle this server belongs to.
+  ps_main_conf_t* main_conf;
   // If pagespeed is configured in some server block but not this one our
   // per-request code will be invoked but server context will be null.  In those
   // cases we need to short circuit, not changing anything.  Currently our
@@ -998,7 +1037,22 @@ void ps_cleanup_loc_conf(void* data) {
   cfg_l->options = NULL;
 }
 
-bool factory_deleted = false;
+// Deletes the cycle's factory once.  `active_driver_factory` is cleared only
+// when it points at this very factory, so a cycle that is discarded (a failed
+// reload) never untracks the factory of the cycle that is still live.
+void ps_delete_cycle_factory(ps_main_conf_t* cfg_m) {
+  if (cfg_m->factory_deleted || cfg_m->driver_factory == NULL) {
+    return;
+  }
+  NgxRewriteDriverFactory* factory = cfg_m->driver_factory;
+  if (active_driver_factory == factory) {
+    active_driver_factory = NULL;
+  }
+  delete factory;
+  cfg_m->driver_factory = NULL;
+  cfg_m->factory_deleted = true;
+}
+
 void ps_cleanup_srv_conf(void* data) {
   ps_srv_conf_t* cfg_s = static_cast<ps_srv_conf_t*>(data);
 
@@ -1006,12 +1060,8 @@ void ps_cleanup_srv_conf(void* data) {
   // to be shut down when we destroy any proxy_fetch_factories. This
   // will prevent any queued callbacks to destroyed proxy fetch factories
   // from being executed
-  if (!factory_deleted && cfg_s->server_context != NULL) {
-    if (active_driver_factory == cfg_s->server_context->factory()) {
-      active_driver_factory = NULL;
-    }
-    delete cfg_s->server_context->factory();
-    factory_deleted = true;
+  if (cfg_s->main_conf != NULL && cfg_s->server_context != NULL) {
+    ps_delete_cycle_factory(cfg_s->main_conf);
   }
   if (cfg_s->proxy_fetch_factory != NULL) {
     delete cfg_s->proxy_fetch_factory;
@@ -1027,13 +1077,12 @@ void ps_cleanup_main_conf(void* data) {
   ps_main_conf_t* cfg_m = static_cast<ps_main_conf_t*>(data);
   delete cfg_m->handler;
   cfg_m->handler = NULL;
+
+  // A cycle without a pagespeed server (or one discarded before
+  // ps_init_module) still owns the factory it created.
+  ps_delete_cycle_factory(cfg_m);
   NgxRewriteDriverFactory::Terminate();
   NgxRewriteOptions::Terminate();
-
-  // reset the factory deleted flag, so we will clean up properly next time,
-  // in case of a configuration reload.
-  // TODO(oschaaf): get rid of the factory_deleted flag
-  factory_deleted = false;
 }
 
 template <typename ConfT> ConfT* ps_create_conf(ngx_conf_t* cf) {
@@ -1079,7 +1128,6 @@ void* ps_create_main_conf(ngx_conf_t* cf) {
   if (cfg_m == NULL) {
     return NULL;
   }
-  CHECK(!factory_deleted);
   NgxRewriteOptions::Initialize();
   NgxRewriteDriverFactory::Initialize();
 
@@ -1088,8 +1136,10 @@ void* ps_create_main_conf(ngx_conf_t* cf) {
       new SystemThreadSystem(),
       "" /* hostname, not used */,
       -1 /* port, not used */);
-  active_driver_factory = cfg_m->driver_factory;
-  active_driver_factory->LoggingInit(ngx_cycle->log, false);
+  // active_driver_factory is not retargeted here: this cycle has not
+  // succeeded yet, and the live cycle's factory must stay tracked if it
+  // fails.  ps_init_module makes it the active one.
+  cfg_m->driver_factory->LoggingInit(ngx_cycle->log, false);
   cfg_m->driver_factory->Init();
   ps_set_conf_cleanup_handler(cf, ps_cleanup_main_conf, cfg_m);
   return cfg_m;
@@ -1100,6 +1150,8 @@ void* ps_create_srv_conf(ngx_conf_t* cf) {
   if (cfg_s == NULL) {
     return NULL;
   }
+  cfg_s->main_conf = static_cast<ps_main_conf_t*>(
+      ngx_http_conf_get_module_main_conf(cf, ngx_pagespeed));
   ps_set_conf_cleanup_handler(cf, ps_cleanup_srv_conf, cfg_s);
   return cfg_s;
 }
@@ -1224,26 +1276,38 @@ char* ps_merge_srv_conf(ngx_conf_t* cf, void* parent, void* child) {
 
 char* ps_merge_loc_conf(ngx_conf_t* cf, void* parent, void* child) {
   ps_loc_conf_t* cfg_l = static_cast<ps_loc_conf_t*>(child);
+  ps_loc_conf_t* parent_cfg_l = static_cast<ps_loc_conf_t*>(parent);
+
   if (cfg_l->options == NULL) {
-    // No directory specific options.
+    // No pagespeed directives in this block.  nginx calls us with the
+    // enclosing location's conf as the parent for a nested location and for
+    // an "if" or "limit_except" block inside a location: those are pretend
+    // locations on the enclosing location's list (ngx_http_rewrite_if,
+    // ngx_http_core_limit_except).  For a top-level location the parent is
+    // the server's loc conf, which never holds pagespeed options, since
+    // server-level directives land in the srv conf (ps_srv_configure) and
+    // ps_merge_srv_conf moves them into the server context before locations
+    // merge.  So a parent with options is always an enclosing location, and
+    // a block without directives of its own inherits its settings.  Without
+    // this the block would fall back to the server-level options and
+    // silently lose what the enclosing location configured.
+    if (parent_cfg_l->options != NULL) {
+      cfg_l->options = parent_cfg_l->options->Clone();
+    }
     return NGX_CONF_OK;
   }
 
-  // While you can't put a "location" block inside a "location" block you can
-  // put an "if" block inside a "location" block, which is implemented by making
-  // a pretend "location" block.  In this case we may have pagespeed options
-  // from the parent "location" block as well as from the current locationish
-  // "if" block.
-  ps_loc_conf_t* parent_cfg_l = static_cast<ps_loc_conf_t*>(parent);
+  // This block has its own pagespeed directives, and is nested inside a block
+  // that also has some.  Rebase our options off of the ones defined in the
+  // parent block, so this block's own directives win.
   if (parent_cfg_l->options != NULL) {
-    // Rebase our options off of the ones defined in the parent location block.
     ps_merge_options(parent_cfg_l->options, &cfg_l->options);
     return NGX_CONF_OK;
   }
 
-  // Pagespeed options are defined in this location block, and it either has no
-  // parent (typical case) or is an if block whose parent location block defines
-  // no pagespeed options.  Base our options off of those in the server block.
+  // Pagespeed options are defined in this location block and its parent block
+  // defines none, so the nearest settings above are the server's.  Base our
+  // options off of those in the server block.
 
   ps_srv_conf_t* cfg_s = static_cast<ps_srv_conf_t*>(
       ngx_http_conf_get_module_srv_conf(cf, ngx_pagespeed));
@@ -1372,6 +1436,30 @@ GoogleString ps_determine_url(ngx_http_request_t* r) {
                 host, port_string, str_to_string_piece(r->unparsed_uri));
 }
 
+// In-place optimization keys its lookups and recordings on the URL the
+// module parsed from the request line; the server selected the location,
+// applied its access rules and chooses the response on its own reading of
+// that line.  An entry is only right when both readings name the same
+// resource, so a request they read differently is left to the server as it
+// is: no lookup, no recording.  Decided in NgxInPlaceUrlAgrees (unit-tested)
+// from the server's normalized URI and the host the module built its URL
+// from, against the path and host of the URL it parsed, with the server
+// block's merge_slashes setting.
+bool ps_in_place_url_agrees(ngx_http_request_t* r, const GoogleUrl& url) {
+  const ngx_http_core_srv_conf_t* cscf = static_cast<ngx_http_core_srv_conf_t*>(
+      ngx_http_get_module_srv_conf(r, ngx_http_core_module));
+  if (NgxInPlaceUrlAgrees(str_to_string_piece(r->uri), ps_determine_host(r),
+                          url.PathSansQuery(), url.Host(),
+                          cscf->merge_slashes != 0)) {
+    return true;
+  }
+  ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                 "ps in-place left to the server, the server and the module "
+                 "read the request differently: %V",
+                 &r->uri);
+  return false;
+}
+
 // we are still at pagespeed phase
 ngx_int_t ps_decline_request(ngx_http_request_t* r) {
   ps_request_ctx_t* ctx = ps_get_request_context(r);
@@ -1433,13 +1521,25 @@ RewriteOptions* ps_determine_remote_options(ps_srv_conf_t* cfg_s) {
       !cfg_s->server_context->global_options()) {
     return NULL;
   }
-  if (!cfg_s->server_context->global_options()
-          ->remote_configuration_url()
-          .empty()) {
-    RewriteOptions* remote_options =
-        cfg_s->server_context->global_options()->Clone();
+  NgxServerContext* server_context = cfg_s->server_context;
+  if (!server_context->global_options()->remote_configuration_url().empty()) {
+    RewriteOptions* remote_options = server_context->global_options()->Clone();
+    // With the native fetcher a remote configuration fetch only makes
+    // progress on the nginx event loop, which is the very thread the wait in
+    // GetRemoteOptions below blocks: every expired cache entry would stall
+    // this worker for the full timeout and still not apply the
+    // configuration.  Don't wait in that case.  The HTTP cache answers
+    // synchronously, so a cached copy is still applied, and the refresh
+    // completes on the free event loop for later requests.  A non-blocking
+    // cache backend (external memcached or redis) keeps the configured
+    // wait, because a timeout of 0 would never apply even a cached copy.
+    if (server_context->ngx_rewrite_driver_factory()->use_native_fetcher() &&
+        server_context->http_cache() != NULL &&
+        server_context->http_cache()->cache()->IsBlocking()) {
+      remote_options->set_remote_configuration_timeout_ms(0);
+    }
     // This fetch is blocking for up to remote_configuration_timeout_ms ms.
-    cfg_s->server_context->GetRemoteOptions(remote_options, false);
+    server_context->GetRemoteOptions(remote_options, false);
     return remote_options;
   }
   return NULL;
@@ -1536,6 +1636,8 @@ bool ps_set_experiment_state_and_cookie(ngx_http_request_t* r,
 // Consider them all, returning appropriate options for this request, of which
 // the caller takes ownership.  If the only applicable options are global,
 // set options to NULL so we can use server_context->global_options().
+// On failure every copy made here is freed and *options is NULL: the caller
+// serves the request without optimization and takes ownership of nothing.
 bool ps_determine_options(ngx_http_request_t* r,
                           RequestHeaders* request_headers,
                           ResponseHeaders* response_headers,
@@ -1594,8 +1696,12 @@ bool ps_determine_options(ngx_http_request_t* r,
   // ExecuteScriptVariables() sets 'pagespeed off' on ngx_options when execution
   // fails and then returns false. When that happens we return, as we don't want
   // to allow enabling pagespeed by request and execute without the intended
-  // configuration.
+  // configuration.  The caller serves the request without optimization and
+  // takes ownership of nothing, so free the copies made for this request here.
   if (!ngx_options->ExecuteScriptVariables(r, cfg_s->handler, ngx_factory)) {
+    delete *options;
+    *options = NULL;
+    delete request_options;
     return false;
   }
 
@@ -1880,6 +1986,17 @@ ngx_int_t ps_resource_handler(ngx_http_request_t* r,
   ps_srv_conf_t* cfg_s = ps_get_srv_config(r);
   ps_request_ctx_t* ctx = ps_get_request_context(r);
 
+  // This cycle's server contexts were never child-initialized: a reload in
+  // single-process mode (master_process off), which ps_init_module refuses.
+  // Decline so nginx serves the request itself instead of dereferencing the
+  // unset proxy fetch factory.
+  if (cfg_s->proxy_fetch_factory == NULL) {
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                  "pagespeed: proxy fetch factory is not initialized for "
+                  "this configuration; serving request without optimization");
+    return NGX_DECLINED;
+  }
+
   if (ngx_terminate || ngx_exiting) {
     cfg_s->server_context->message_handler()->Message(
         kInfo, "ps_resource_handler declining: nginx worker is shutting down");
@@ -1924,7 +2041,10 @@ ngx_int_t ps_resource_handler(ngx_http_request_t* r,
                             &options, request_context, cfg_s, &url,
                             &pagespeed_query_params, &pagespeed_option_cookies,
                             html_rewrite)) {
-    return NGX_ERROR;
+    // This request's options could not be determined (a script variable
+    // evaluated to a value the configuration rejects).  Serve the request
+    // without optimization rather than failing it.
+    return NGX_DECLINED;
   }
 
   // Take ownership of custom_options.
@@ -2075,7 +2195,10 @@ ngx_int_t ps_resource_handler(ngx_http_request_t* r,
     GoogleString mapped_url;
     GoogleString host_header;
 
-    if (options->domain_lawyer()->MapOriginUrl(
+    // Only GET and HEAD are answered through the proxy branch (and so from
+    // the cache); any other method is left to nginx.
+    if ((r->method == NGX_HTTP_GET || r->method == NGX_HTTP_HEAD) &&
+        options->domain_lawyer()->MapOriginUrl(
             url, &mapped_url, &host_header, &is_proxy) && is_proxy) {
       ps_create_base_fetch(url.Spec(), ctx, request_context,
                            request_headers.release(), kPageSpeedProxy, options);
@@ -2102,6 +2225,12 @@ ngx_int_t ps_resource_handler(ngx_http_request_t* r,
   }
 
   if (html_rewrite && options->IsAllowed(url.Spec())) {
+    // The HTML pipeline runs a HEAD like the GET it answers (the same
+    // response headers, Vary included); nginx drops the body of a HEAD
+    // response itself.
+    if (request_headers->method() == RequestHeaders::kHead) {
+      request_headers->set_method(RequestHeaders::kGet);
+    }
     ps_create_base_fetch(url.Spec(), ctx, request_context,
                          request_headers.release(), kHtmlTransform, options);
     // Do not store driver in request_context, it's not safe.
@@ -2143,9 +2272,13 @@ ngx_int_t ps_resource_handler(ngx_http_request_t* r,
     return NGX_OK;
   }
 
+  // In-place optimization also leaves a request the server and the module
+  // read differently to the server: no lookup, no recording (see
+  // ps_in_place_url_agrees).
   if (options->in_place_rewriting_enabled() &&
       options->enabled() &&
-      options->IsAllowed(url.Spec())) {
+      options->IsAllowed(url.Spec()) &&
+      ps_in_place_url_agrees(r, url)) {
     ps_create_base_fetch(url.Spec(), ctx, request_context,
                          request_headers.release(), kIproLookup, options);
 
@@ -2387,8 +2520,12 @@ ngx_int_t ps_html_rewrite_header_filter(ngx_http_request_t* r) {
     // Don't handle subrequests.
     return ngx_http_next_header_filter(r);
   }
-  // Poll for cache flush on every request (polls are rate-limited).
-  cfg_s->server_context->FlushCacheIfNecessary();
+  // Poll for cache flush on every request (polls are rate-limited).  A
+  // context that was never child-initialized has no timer or cache path to
+  // poll with.
+  if (cfg_s->server_context->initialized()) {
+    cfg_s->server_context->FlushCacheIfNecessary();
+  }
 
   ps_request_ctx_t* ctx = ps_get_request_context(r);
 
@@ -2808,6 +2945,11 @@ ngx_int_t ps_simple_handler(ngx_http_request_t* r,
     }
   }
 
+  // Both cases answer this request themselves (the decline points are
+  // past), so the request body must be discarded before the send; see
+  // ps_discard_request_body.  (No method check on these paths, so a body
+  // may be present.)
+  ps_discard_request_body(r);
   return send_out_headers_and_body(r, response_headers, output);
 }
 
@@ -2855,19 +2997,20 @@ bool ps_request_body_to_string_piece(
   }
 
   if (r->request_body->temp_file) {
-    u_char buf[POST_BUF_READ_SIZE];
-    int count = 0;
-    ssize_t ret;
+    ngx_file_t* file = &r->request_body->temp_file->file;
     GoogleString tmp;
-
-    // Note that we depend on nginx to impose sensible limits on post data.
-    while ((ret = ngx_read_file(&r->request_body->temp_file->file,
-                                buf, POST_BUF_READ_SIZE, count)) > 0) {
-      tmp.append(reinterpret_cast<char*>(buf), ret);
-      count += ret;
-    }
-
-    if (ret < 0) {
+    NgxRequestBodyStatus status = NgxReadRequestBody(
+        [file](char* buf, size_t size, int64 offset) -> int64 {
+          return ngx_read_file(file, reinterpret_cast<u_char*>(buf), size,
+                               static_cast<off_t>(offset));
+        },
+        kNgxMaxRequestBodyBytes, &tmp);
+    if (status == kNgxRequestBodyTooLarge) {
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                    "ps_request_body_to_string_piece: "
+                    "post body too large.");
+      return false;
+    } else if (status != kNgxRequestBodyOk) {
       ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
                     "ps_request_body_to_string_piece: "
                     "error reading post body.");
@@ -2876,10 +3019,14 @@ bool ps_request_body_to_string_piece(
 
     // We have read the complete post body, copy it to a buffer
     // from the request's pool.
-    u_char* data = reinterpret_cast<u_char*>(ngx_palloc(r->pool, count));
-    memcpy(data, tmp.c_str(), count);
-    *out = StringPiece(reinterpret_cast<char*>(data), count);
-
+    if (!NgxCopyRequestBody(
+            tmp, [r](size_t n) -> void* { return ngx_palloc(r->pool, n); },
+            out)) {
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                    "ps_request_body_to_string_piece: "
+                    "failed to allocate memory");
+      return false;
+    }
     return true;
   } else if (r->request_body->bufs->next == NULL) {
     // There's just one buffer, so we can simply return a StringPiece pointing
@@ -3005,6 +3152,15 @@ ngx_int_t ps_content_handler(ngx_http_request_t* r) {
   ps_srv_conf_t* cfg_s = ps_get_srv_config(r);
   if (ps_disabled(cfg_s)) {
     // Pagespeed is not on for this server block.
+    return NGX_DECLINED;
+  }
+
+  // A server context that was never child-initialized (the new cycle of a
+  // reload in single-process mode, which ps_init_module refuses) cannot
+  // serve any pagespeed route: its statistics, timers and caches were never
+  // set up.  Decline everything, beacons and admin paths included, before
+  // touching that state.
+  if (!cfg_s->server_context->initialized()) {
     return NGX_DECLINED;
   }
 
@@ -3254,6 +3410,26 @@ ngx_int_t ps_init_module(ngx_cycle_t* cycle) {
     return NGX_OK;
   }
 
+  const bool initial_cycle =
+      (cycle->old_cycle == NULL || cycle->old_cycle->conf_ctx == NULL);
+
+  // nginx reconfigures a reload in the same process, but in single-process
+  // mode (master_process off) it never re-runs the init_process hooks for
+  // the new cycle: ngx_single_process_cycle only calls ngx_init_cycle.  The
+  // server contexts built for this cycle would then never be
+  // child-initialized, and the first HTML request would reach
+  // ps_resource_handler with an unset ProxyFetchFactory.  Refuse to bring
+  // the module up for such a cycle instead: requests are served unoptimized
+  // (ps_resource_handler declines on the unset factory) until nginx is
+  // restarted.
+  if (!initial_cycle && ngx_process == NGX_PROCESS_SINGLE) {
+    ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                  "ngx_pagespeed: reload with master_process off is not "
+                  "supported; optimization will stay off until nginx is "
+                  "restarted");
+    return NGX_OK;
+  }
+
   ngx_http_core_main_conf_t* cmcf = static_cast<ngx_http_core_main_conf_t*>(
       ngx_http_cycle_get_module_main_conf(cycle, ngx_http_core_module));
   ngx_http_core_srv_conf_t** cscfp = static_cast<ngx_http_core_srv_conf_t**>(
@@ -3276,8 +3452,10 @@ ngx_int_t ps_init_module(ngx_cycle_t* cycle) {
   cfg_m->driver_factory->PostConfig(
       server_contexts, &error_message, &error_index, &global_statistics);
   if (error_index != -1) {
-    server_contexts[error_index]->message_handler()->Message(
-        kError, "ngx_pagespeed is enabled. %s", error_message.c_str());
+    // The per-server handler is only created at child init and is null in the
+    // master, so report through the main configuration's handler.
+    cfg_m->handler->Message(kError, "ngx_pagespeed is enabled. %s",
+                            error_message.c_str());
     return NGX_ERROR;
   }
 
@@ -3308,11 +3486,62 @@ ngx_int_t ps_init_module(ngx_cycle_t* cycle) {
     }
 
     cfg_m->driver_factory->LoggingInit(cycle->log, true);
-    cfg_m->driver_factory->RootInit();
+    // A configuration test validates the configuration and must not create
+    // cache volumes: RootInit registers every cache path and opens (creating
+    // and syncing, on a fresh directory) its volumes, which takes over a
+    // minute on a slow disk.  Nothing below depends on it.
+    if (!ngx_test_config) {
+      cfg_m->driver_factory->RootInit();
+    }
+    // This cycle is the live one now.
+    active_driver_factory = cfg_m->driver_factory;
   } else {
-    delete cfg_m->driver_factory;
-    cfg_m->driver_factory = NULL;
-    active_driver_factory = NULL;
+    // No pagespeed server in this cycle.  The previous cycle's factory, if
+    // any, stays the tracked one until that cycle's own cleanup deletes it.
+    ps_delete_cycle_factory(cfg_m);
+  }
+
+  // Interim mitigation for the native fetcher: a remote configuration
+  // refresh can only progress on the nginx event loop, so waiting for it on
+  // the request path holds up every connection on the worker for the full
+  // RemoteConfigurationTimeoutMs.  With a blocking HTTP cache the request
+  // path does not wait (see ps_determine_remote_options); on a non-blocking
+  // (external) cache backend the configured wait is kept, because a timeout
+  // of 0 would never apply even a cached copy.  One warning per affected
+  // server.  This runs in the master, where the per-server message handler
+  // and the caches are wired only later, at ChildInit in the workers: log
+  // through the main conf's handler (as the resolver check above does) and
+  // decide the cache case from configuration.
+  for (size_t i = 0; i < server_contexts.size(); ++i) {
+    SystemServerContext* server_context = server_contexts[i];
+    const RewriteOptions* options = server_context->global_options();
+    if (!cfg_m->driver_factory->use_native_fetcher() || options == NULL ||
+        options->remote_configuration_url().empty()) {
+      continue;
+    }
+    const SystemRewriteOptions* system_options =
+        SystemRewriteOptions::DynamicCast(options);
+    bool external_cache = false;
+    if (system_options != NULL) {
+      external_cache = !system_options->redis_server().empty() ||
+                       !system_options->memcached_servers().empty();
+    }
+    if (external_cache) {
+      cfg_m->handler->Message(
+          kWarning,
+          "RemoteConfigurationUrl %s is set and UseNativeFetcher is on: "
+          "requests may stall up to RemoteConfigurationTimeoutMs while "
+          "the remote configuration refreshes.",
+          options->remote_configuration_url().c_str());
+    } else {
+      cfg_m->handler->Message(
+          kWarning,
+          "RemoteConfigurationUrl %s is set and UseNativeFetcher is on: "
+          "pagespeed will not wait for a remote configuration refresh on "
+          "the request path; requests during a refresh are served with "
+          "the local configuration.",
+          options->remote_configuration_url().c_str());
+    }
   }
   return NGX_OK;
 }

@@ -67,6 +67,7 @@ extern "C" {
 #include "pagespeed/kernel/http/request_headers.h"
 #include "pagespeed/kernel/http/response_headers.h"
 #include "pagespeed/kernel/http/response_headers_parser.h"
+#include "pagespeed/nginx/ngx_fetch_body.h"
 
 namespace net_instaweb {
 
@@ -784,8 +785,9 @@ void NgxFetch::ConnectionReadHandler(ngx_event_t* rev) {
       // all if we at least parsed the headers.
       // If we do know the content length, having a mismatch on the bytes read
       // will be interpreted as an error.
-      ok = (fetch->content_length_known_ && fetch->content_length_ == fetch->bytes_received_)
-          || fetch->parser_.headers_complete();
+      ok = NgxFetchCompleteOnClose(
+          fetch->parser_.headers_complete(), fetch->content_length_known_,
+          fetch->content_length_, fetch->bytes_received_);
       fetch->done_ = true;
       break;
     } else if (n > 0) {
@@ -854,9 +856,12 @@ bool NgxFetch::HandleHeader(ngx_connection_t* c) {
   if (n > size) {
     return false;
   } else if (fetch->parser_.headers_complete()) {
-    // TODO(oschaaf): We should also check if the request method was HEAD
-    // - but I don't think PSOL uses that at this point.
-    if (fetch->get_status_code() == 304 || fetch->get_status_code() == 204) {
+    // A HEAD response announces the length of a body it does not send, so
+    // it is complete with its headers, like a 204 or 304.
+    if (NgxFetchResponseHasNoBody(
+            fetch->get_status_code(),
+            fetch->async_fetch_->request_headers()->method() ==
+                RequestHeaders::kHead)) {
       fetch->done_ = true;
     } else if (fetch->async_fetch_->response_headers()->FindContentLength(
             &fetch->content_length_)) {
@@ -896,18 +901,29 @@ bool NgxFetch::HandleBody(ngx_connection_t* c) {
   NgxFetch* fetch = static_cast<NgxFetch*>(c->data);
   char* data = reinterpret_cast<char*>(fetch->in_->pos);
   size_t size = fetch->in_->last - fetch->in_->pos;
+  NgxFetchBodyStep step =
+      NgxFetchAcceptBody(fetch->content_length_known_, fetch->content_length_,
+                         fetch->bytes_received_, size);
 
-  fetch->bytes_received_add(size);
+  fetch->bytes_received_add(step.accept);
 
   ngx_log_error(NGX_LOG_DEBUG, fetch->log_, 0,
                 "NgxFetch %p: Handle body (%d bytes)", fetch, size);
 
-  if ( fetch->async_fetch_->Write(StringPiece(data, size),
-                                  fetch->message_handler()) ) {
-    if (fetch->bytes_received_ == fetch->content_length_) {
+  if (fetch->async_fetch_->Write(StringPiece(data, step.accept),
+                                 fetch->message_handler())) {
+    if (step.complete) {
       fetch->done_ = true;
     }
     fetch->in_->pos += size;
+    if (step.overflow) {
+      // More bytes than the announced content length: the response is
+      // malformed, and the connection must not be reused.
+      fetch->message_handler()->Message(
+          kWarning, "NgxFetch %p: response body exceeds its content-length",
+          fetch);
+      return false;
+    }
   } else {
     ngx_log_error(NGX_LOG_DEBUG, fetch->log_, 0,
                   "NgxFetch %p: async fetch write failure", fetch);

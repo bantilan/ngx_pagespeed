@@ -64,6 +64,7 @@ extern "C" {
 #include "ngx_pagespeed.h"
 
 #include "pagespeed/kernel/base/basictypes.h"
+#include "pagespeed/nginx/ngx_gzip_rollback.h"
 
 namespace net_instaweb {
 
@@ -85,15 +86,16 @@ enum gzs_enable_result {
 };
 
 class NgxGZipSetter {
-  std::vector<ngx_flag_t*> ngx_flags_set_;
-  std::vector<ngx_uint_t*> ngx_uint_set_;
-  std::vector<void*> ngx_httptypes_set_;
+  // The slots the automatic setup wrote in this configuration cycle, so an
+  // explicit gzip directive can roll them back.  Reset by Init() for every
+  // cycle: without that, a reload would roll back slots recorded during the
+  // previous configuration, through memory nginx already freed.
+  NgxGZipRollbackLog rollback_;
   ngx_command_ctx gzip_command_;
   ngx_command_ctx gzip_http_types_command_;
   ngx_command_ctx gzip_proxied_command_;
   ngx_command_ctx gzip_vary_command_;
   ngx_command_ctx gzip_http_version_command_;
-  bool enabled_;
 
  public:
   NgxGZipSetter();
@@ -114,7 +116,7 @@ class NgxGZipSetter {
   void AddGZipHTTPTypes(ngx_conf_t* cf);
   void RollBackAndDisable(ngx_conf_t* cf);
 
-  bool enabled() { return enabled_; }
+  bool enabled() { return rollback_.enabled(); }
 
  private:
   DISALLOW_COPY_AND_ASSIGN(NgxGZipSetter);

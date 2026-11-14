@@ -57,6 +57,7 @@ extern "C" {
 #include <ngx_http.h>
 }
 
+#include <atomic>
 #include <pthread.h>
 
 #include "ngx_pagespeed.h"
@@ -162,7 +163,7 @@ class NgxBaseFetch : public AsyncFetch {
   // it's zero we delete ourself.
   int DecrefAndDeleteIfUnreferenced();
 
-  static NgxEventConnection* event_connection;
+  static std::atomic<NgxEventConnection*> event_connection;
 
   // Live count of NgxBaseFetch instances that are currently in use.
   static int active_base_fetches;
