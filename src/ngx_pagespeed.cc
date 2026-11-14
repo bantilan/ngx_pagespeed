@@ -2338,7 +2338,13 @@ ngx_int_t ps_etag_header_filter(ngx_http_request_t* r) {
   }
 #endif
 
-  if (ctx && ctx->recorder) {
+  // Never on the response to a request that carried Authorization. The
+  // recorder refuses to store such a response unless the origin marked it
+  // public (ResponseHeaders::IsProxyCacheable), and s-maxage is one of the
+  // directives that lets a shared cache store a response to an authenticated
+  // request and reuse it for other clients (RFC 9111 section 3.5): adding it
+  // here would grant downstream caches a permission the origin did not give.
+  if (ctx && ctx->recorder && r->headers_in.authorization == NULL) {
     ps_srv_conf_t* cfg_s = ps_get_srv_config(r);
     int s_maxage_sec =
         cfg_s->server_context->global_options()->EffectiveInPlaceSMaxAgeSec();
