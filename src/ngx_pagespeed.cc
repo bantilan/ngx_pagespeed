@@ -65,6 +65,7 @@
 #include "pagespeed/kernel/base/string.h"
 #include "pagespeed/kernel/base/string_writer.h"
 #include "pagespeed/kernel/base/time_util.h"
+#include "pagespeed/kernel/cache/purge_set.h"
 #include "pagespeed/kernel/http/content_type.h"
 #include "pagespeed/kernel/http/google_url.h"
 #include "pagespeed/kernel/http/query_params.h"
@@ -631,10 +632,30 @@ ngx_int_t copy_response_headers_to_ngx(
       }
     }  // else we don't preserve any headers.
 
+    // A header that is not valid on the wire is left out of the response.
+    if (name_gs.find('\0') != GoogleString::npos ||
+        value_gs.find('\0') != GoogleString::npos) {
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                    "pagespeed: dropping response header that holds a NUL");
+      continue;
+    }
+
+    // A length that cannot be read is left out; nginx then states the length
+    // it knows, or sends the body chunked.
+    if (StringCaseEqual(name_gs, "Content-Length")) {
+      int64 content_length;
+      if (!pagespeed_headers.FindContentLength(&content_length) ||
+          content_length < 0 ||
+          value_gs.find_first_not_of("0123456789") != GoogleString::npos) {
+        continue;
+      }
+    }
+
+    // The allocation has to hold the len bytes nginx reads.
     ngx_str_t name, value;
     value.len = value_gs.size();
     value.data = reinterpret_cast<u_char*>(
-        string_piece_to_pool_string(r->pool, value_gs.c_str()));
+        string_piece_to_pool_string(r->pool, value_gs));
 
     // To prevent the gzip module from clearing weak etags, we output them
     // using a different name here. The etag header filter module runs behind
@@ -647,7 +668,7 @@ ngx_int_t copy_response_headers_to_ngx(
     } else {
       name.len = name_gs.size();
       name.data = reinterpret_cast<u_char*>(
-          string_piece_to_pool_string(r->pool, name_gs.c_str()));
+          string_piece_to_pool_string(r->pool, name_gs));
     }
 
     // In case string_piece_to_pool_string failed:
@@ -686,11 +707,13 @@ ngx_int_t copy_response_headers_to_ngx(
       continue;
       // TODO(oschaaf): are there any other headers we should not try to
       // copy here?
-    } else if (STR_EQ_LITERAL(name, "Connection")) {
+    } else if (StringCaseEqual(
+                   name_gs,
+                   "Connection")) {
       continue;
-    } else if (STR_EQ_LITERAL(name, "Keep-Alive")) {
+    } else if (StringCaseEqual(name_gs, "Keep-Alive")) {
       continue;
-    } else if (STR_EQ_LITERAL(name, "Transfer-Encoding")) {
+    } else if (StringCaseEqual(name_gs, "Transfer-Encoding")) {
       continue;
     } else if (STR_EQ_LITERAL(name, "Vary") && value.len
         && STR_EQ_LITERAL(value, "Accept-Encoding")) {
@@ -726,11 +749,12 @@ ngx_int_t copy_response_headers_to_ngx(
       }
     } else if (STR_EQ_LITERAL(name, "Server")) {
       headers_out->server = header;
-    } else if (STR_EQ_LITERAL(name, "Content-Length")) {
+    } else if (StringCaseEqual(name_gs, "Content-Length")) {
       int64 len;
-      CHECK(pagespeed_headers.FindContentLength(&len));
-      headers_out->content_length_n = len;
-      headers_out->content_length = header;
+      if (pagespeed_headers.FindContentLength(&len)) {
+        headers_out->content_length_n = len;
+        headers_out->content_length = header;
+      }
     } else if (STR_EQ_LITERAL(name, "Content-Encoding")) {
       headers_out->content_encoding = header;
     } else if (STR_EQ_LITERAL(name, "Refresh")) {
@@ -1683,6 +1707,12 @@ bool ps_determine_options(ngx_http_request_t* r,
     } else {
       *options = directory_options->Clone();
     }
+    // The location's options were rebased on the server's when the
+    // configuration was read, so the cache invalidation state they carry (the
+    // flush timestamp and the purged URLs) is from then.  Purges and flushes
+    // are recorded on the server's options as they happen: take the current
+    // ones, so they apply under every location.
+    (*options)->UpdateCachePurgeSet(global_options->purge_set());
   } else {
     if (*options == NULL) {
       *options = global_options->Clone();
@@ -2102,23 +2132,17 @@ ngx_int_t ps_resource_handler(ngx_http_request_t* r,
     // TODO(jefftk): Is this the right place to be modifying caching headers for
     // html fetches?  Or should that be done later, in the headers flow for
     // filter mode, rather than here in resource fetch mode?
-    if (!options->modify_caching_headers()) {
-      ctx->preserve_caching_headers = kPreserveAllCachingHeaders;
-    } else if (!options->IsDownstreamCacheIntegrationEnabled()) {
-      // Downstream cache integration is not enabled. Disable original
-      // Cache-Control headers.
-      ctx->preserve_caching_headers = kDontPreserveHeaders;
-    } else if (!pagespeed_resource && !is_an_admin_handler) {
-      ctx->preserve_caching_headers = kPreserveOnlyCacheControl;
-      // Downstream cache integration is enabled. If a rebeaconing key has been
-      // configured and there is a ShouldBeacon header with the correct key,
-      // disable original Cache-Control headers so that the instrumented page is
-      // served out with no-cache.
-      StringPiece should_beacon(request_headers->Lookup1(kPsaShouldBeacon));
-      if (options->MatchesDownstreamCacheRebeaconingKey(should_beacon)) {
-        ctx->preserve_caching_headers = kDontPreserveHeaders;
-      }
-    }
+    NgxCachingHeaderRequest caching_request;
+    caching_request.modify_caching_headers = options->modify_caching_headers();
+    caching_request.downstream_cache_integration =
+        options->IsDownstreamCacheIntegrationEnabled();
+    caching_request.pagespeed_resource = pagespeed_resource;
+    caching_request.admin_handler = is_an_admin_handler;
+    caching_request.rebeaconing_key_matches =
+        options->MatchesDownstreamCacheRebeaconingKey(
+            request_headers->Lookup1(kPsaShouldBeacon));
+    ctx->preserve_caching_headers =
+        NgxPreserveCachingHeadersFor(caching_request);
 
     ctx->recorder = NULL;
     ctx->url_string = url_string;
@@ -2346,7 +2370,14 @@ void ps_send_to_pagespeed(ngx_http_request_t* r,
         int num_inflated_bytes = ctx->inflater_->InflateBytes(
             buf, kStackBufferSize);
         if (num_inflated_bytes < 0) {
-          cfg_s->handler->Message(kWarning, "Corrupted inflation");
+          // The rest of the response is dropped either way.
+          if (ctx->inflater_->limit_exceeded()) {
+            cfg_s->handler->Message(
+                kWarning, "Compressed HTML inflates to more than %d bytes",
+                static_cast<int>(GzipInflater::kMaxInflatedHtmlBytes));
+          } else {
+            cfg_s->handler->Message(kWarning, "Corrupted inflation");
+          }
         } else if (num_inflated_bytes > 0) {
           ctx->proxy_fetch->Write(StringPiece(buf, num_inflated_bytes),
                                   cfg_s->handler);
@@ -2582,6 +2613,24 @@ ngx_int_t ps_html_rewrite_header_filter(ngx_http_request_t* r) {
         r->headers_out.content_encoding = NULL;
         ctx->inflater_ = new GzipInflater(inflate_type);
         ctx->inflater_->Init();
+        ctx->inflater_->set_max_inflated_bytes(
+            GzipInflater::kMaxInflatedHtmlBytes);
+      }
+    }
+  }
+
+  // Note the private and no-store the operator or the origin stated, before
+  // the optimization library computes the page's caching headers: the
+  // Cache-Control the module writes on the rewritten page keeps them.
+  ctx->html_cache_control_limits = NgxCacheControlLimits();
+  {
+    ngx_table_elt_t* header;
+    NgxListIterator it(&(r->headers_out.headers.part));
+    while ((header = it.Next()) != NULL) {
+      if (header->hash != 0 &&
+          STR_CASE_EQ_LITERAL(header->key, "Cache-Control")) {
+        NgxNoteCacheControlLimits(str_to_string_piece(header->value),
+                                  &ctx->html_cache_control_limits);
       }
     }
   }
@@ -3227,7 +3276,28 @@ ngx_http_output_header_filter_pt ngx_http_next_header_filter;
 
 // Clear a few headers from html responses.
 
+// An origin may send the RequestOptionOverride token in its response to have
+// its own option headers honoured.  The token is a credential: the option
+// scan drops it from the responses it reads, and this drops it from every
+// response, including the ones that are never scanned.
+void ps_remove_option_override_token(ngx_http_request_t* r) {
+  ngx_table_elt_t* header;
+  NgxListIterator it(&(r->headers_out.headers.part));
+  while ((header = it.Next()) != NULL) {
+    if (header->hash != 0 && RewriteQuery::IsRequestOptionOverrideName(
+                                 str_to_string_piece(header->key))) {
+      // Response headers with hash of 0 are excluded from the response.
+      header->hash = 0;
+    }
+  }
+}
+
 ngx_int_t ps_html_rewrite_fix_headers_filter(ngx_http_request_t* r) {
+  // Every response passes here, so a response is neither sent nor stored
+  // with the token.
+  if (r == r->main) {
+    ps_remove_option_override_token(r);
+  }
   ps_request_ctx_t* ctx = ps_get_request_context(r);
   if (r != r->main || ctx == NULL || !ctx->html_rewrite ||
       ctx->preserve_caching_headers == kPreserveAllCachingHeaders) {
@@ -3235,9 +3305,14 @@ ngx_int_t ps_html_rewrite_fix_headers_filter(ngx_http_request_t* r) {
   }
   if (ctx->preserve_caching_headers == kDontPreserveHeaders) {
     // Don't cache html.  See mod_instaweb:instaweb_fix_headers_filter.
+    // Never more storable than the operator or the origin said: their
+    // private and no-store stay on the one line written here.
     NgxCachingHeaders caching_headers(r);
-    ps_set_cache_control(r, string_piece_to_pool_string(
-        r->pool, caching_headers.GenerateDisabledCacheControl()));
+    ps_set_cache_control(
+        r, string_piece_to_pool_string(
+               r->pool, NgxKeepCacheControlLimits(
+                            caching_headers.GenerateDisabledCacheControl(),
+                            ctx->html_cache_control_limits)));
   }
 
   // Pagespeed html doesn't need etags: it should never be cached.

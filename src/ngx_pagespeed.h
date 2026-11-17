@@ -37,6 +37,8 @@ extern "C" {
 }
 
 #include "base/logging.h"
+#include "ngx_cache_control_merge.h"
+#include "ngx_caching_header_policy.h"
 #include "pagespeed/kernel/base/string_util.h"
 #include "pagespeed/kernel/http/response_headers.h"
 
@@ -78,12 +80,6 @@ StringPiece str_to_string_piece(ngx_str_t s);
 // over.  Returns NULL if we can't get memory.
 char* string_piece_to_pool_string(ngx_pool_t* pool, StringPiece sp);
 
-enum PreserveCachingHeaders {
-  kPreserveAllCachingHeaders,  // Cache-Control, ETag, Last-Modified, etc
-  kPreserveOnlyCacheControl,   // Only Cache-Control.
-  kDontPreserveHeaders,
-};
-
 typedef struct {
   NgxBaseFetch* base_fetch;
 
@@ -93,6 +89,10 @@ typedef struct {
   bool in_place;
 
   PreserveCachingHeaders preserve_caching_headers;
+
+  // The private and no-store the operator or the origin stated for an HTML
+  // page, noted before the module computes the page's own caching headers.
+  NgxCacheControlLimits html_cache_control_limits;
 
   // for html rewrite
   ProxyFetch* proxy_fetch;
