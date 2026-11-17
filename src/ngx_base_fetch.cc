@@ -40,6 +40,11 @@ const char kHeadersComplete = 'H';
 const char kFlush = 'F';
 const char kDone = 'D';
 
+// Output held for the client is sent on once a window's worth has
+// accumulated, rather than at the next flush or at the end of the response,
+// so a very large response is not held whole in memory.
+const size_t kMaxBufferedOutputBytes = 1 << 20;
+
 std::atomic<NgxEventConnection*> NgxBaseFetch::event_connection(NULL);
 int NgxBaseFetch::active_base_fetches = 0;
 
@@ -264,7 +269,16 @@ bool NgxBaseFetch::HandleWrite(const StringPiece& sp,
                                MessageHandler* handler) {
   Lock();
   buffer_.append(sp.data(), sp.size());
+  // A window's worth of held output goes out like a flush, so the response
+  // is not held whole until its end. Same mechanism as HandleFlush.
+  bool flush = (buffer_.size() >= kMaxBufferedOutputBytes);
+  if (flush) {
+    need_flush_ = true;
+  }
   Unlock();
+  if (flush) {
+    RequestCollection(kFlush);
+  }
   return true;
 }
 
